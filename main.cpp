@@ -15,7 +15,7 @@
 static const float c_pi = 3.14159265359f;
 static const float c_goldenRatioConjugate = 0.61803398875f;
 
-static const size_t c_numSamples = 256;
+static const size_t c_numSamples = 32;
 static const size_t c_numTests = 10000;
 
 #define DETERMINISTIC() true   // if true, all randomization will be the same every time.
@@ -148,7 +148,6 @@ struct Samples
     const char* name = nullptr;
     SamplesFn function;
     bool deterministic = true;
-    bool progressive = true;
 };
 
 void Samples_WhiteNoise(std::vector<Vec2>& points, size_t count, int seed)
@@ -320,11 +319,11 @@ void Samples_Halton_2_3(std::vector<Vec2>& points, size_t count, int seed)
 
 Samples g_samples[] =
 {
-    {"White Noise", Samples_WhiteNoise, false, true},
-    {"Blue Noise", Samples_BlueNoise, false, true},
-    {"Halton(2,3)", Samples_Halton_2_3, true, true},
-    {"Sobol", Samples_Sobol, true, true},
-    {"R2", Samples_R2, true, true},
+    {"White Noise", Samples_WhiteNoise, false},
+    {"Blue Noise", Samples_BlueNoise, false},
+    {"Halton(2,3)", Samples_Halton_2_3, true},
+    {"Sobol", Samples_Sobol, true},
+    {"R2", Samples_R2, true},
 };
 
 // ====================================================================
@@ -364,23 +363,12 @@ void DoTest(const LAMBDA& lambda, const float c_actualValue, const Samples& samp
     std::vector<Vec2> samplePoints;
     samples.function(samplePoints, c_numSamples, (int)testIndex);
 
-    // generate a random offset for deterministic samples
-    Vec2 offset{ 0.0f, 0.0f };
-    if (samples.deterministic)
-    {
-        std::mt19937 rng = GetRNG(int(testIndex));
-        std::uniform_real_distribution<float> dist(0.0f, 1.0f);
-        offset = Vec2{ dist(rng), dist(rng) };
-    }
-    offset[0] += sampleOffset[0];
-    offset[1] += sampleOffset[1];
-
     // do sampling
     float value = 0.0f;
     for (size_t index = 0; index < c_numSamples; ++index)
     {
         // monte carlo integrate into value using these samples
-        float sampleValue = lambda(samplePoints[(index + indexOffset) % c_numSamples], offset);
+        float sampleValue = lambda(samplePoints[(index + indexOffset) % c_numSamples], sampleOffset);
         value = Lerp(value, sampleValue, 1.0f / float(index + 1));
 
         // calculate the abs error
@@ -426,48 +414,51 @@ void Test(const char* shapeName, float actualValue, const LAMBDA& lambda, const 
     for (size_t index = 1; index <= c_numSamples; ++index)
         SetCSV(results, 0, index, "%zu", index);
 
+    std::vector<float> absError(c_numSamples, 0.0f);
+    std::vector<float> sqAbsError(c_numSamples, 0.0f);
+    std::vector<std::vector<float>> absErrors(c_numTests);
+
     // for each type of sampling
     for (const Samples& samples : g_samples)
     {
         // do the tests
-        std::vector<std::vector<float>> absErrors(c_numTests);
-        int lastPercent = -1;
-        std::atomic<int> testsDone = 0;
-        #pragma omp parallel for
-        for (int testIndex = 0; testIndex < c_numTests; ++testIndex)
+        if (samples.deterministic)
         {
-            int percent = int(100.0f * float(testsDone.fetch_add(1)) / float(c_numTests));
-            if (percent != lastPercent)
-            {
-                printf("\r%s: %i%%", samples.name, percent);
-                lastPercent = percent;
-            }
-            DoTest(lambda, actualValue, samples, absErrors[testIndex], testIndex, sampleOffset, indexOffset);
-        }
-        printf("\r%s: 100%%\n", samples.name);
-
-        // create a combined absError and sqAbsError
-        std::vector<float> absError(c_numSamples, 0.0f);
-        std::vector<float> sqAbsError(c_numSamples, 0.0f);
-        for (int testIndex = 0; testIndex < c_numTests; ++testIndex)
-        {
+            DoTest(lambda, actualValue, samples, absErrors[0], 0, sampleOffset, indexOffset);
             for (size_t sampleIndex = 0; sampleIndex < c_numSamples; ++sampleIndex)
             {
-                absError[sampleIndex] = Lerp(absError[sampleIndex], absErrors[testIndex][sampleIndex], 1.0f / float(testIndex + 1));
-                sqAbsError[sampleIndex] = Lerp(sqAbsError[sampleIndex], absErrors[testIndex][sampleIndex] * absErrors[testIndex][sampleIndex], 1.0f / float(testIndex + 1));
+                absError[sampleIndex] = absErrors[0][sampleIndex];
+                sqAbsError[sampleIndex] = absErrors[0][sampleIndex] * absErrors[0][sampleIndex];
             }
         }
-
-        // if not progressive, only report the final error amount
-        if (!samples.progressive)
+        // non deterministic tests do multiple tests and average them
+        else
         {
-            float lastAbsError = *absError.rbegin();
-            float lastSqAbsError = *sqAbsError.rbegin();
-            for (float& f : absError)
-                f = lastAbsError;
-            for (float& f : sqAbsError)
-                f = lastSqAbsError;
+            int lastPercent = -1;
+            std::atomic<int> testsDone = 0;
+            #pragma omp parallel for
+            for (int testIndex = 0; testIndex < c_numTests; ++testIndex)
+            {
+                int percent = int(100.0f * float(testsDone.fetch_add(1)) / float(c_numTests));
+                if (percent != lastPercent)
+                {
+                    printf("\r%s: %i%%", samples.name, percent);
+                    lastPercent = percent;
+                }
+                DoTest(lambda, actualValue, samples, absErrors[testIndex], testIndex, sampleOffset, indexOffset);
+            }
+
+            // create a combined absError and sqAbsError
+            for (int testIndex = 0; testIndex < c_numTests; ++testIndex)
+            {
+                for (size_t sampleIndex = 0; sampleIndex < c_numSamples; ++sampleIndex)
+                {
+                    absError[sampleIndex] = Lerp(absError[sampleIndex], absErrors[testIndex][sampleIndex], 1.0f / float(testIndex + 1));
+                    sqAbsError[sampleIndex] = Lerp(sqAbsError[sampleIndex], absErrors[testIndex][sampleIndex] * absErrors[testIndex][sampleIndex], 1.0f / float(testIndex + 1));
+                }
+            }
         }
+        printf("\r%s: 100%%\n", samples.name);
 
         // write to the csv
         size_t col = GetCSVCols(results);
@@ -491,6 +482,7 @@ void Test(const char* shapeName, float actualValue, const LAMBDA& lambda, const 
     WriteCSV(results, fileName);
 
     // run the python script
+    printf("Running Python\n");
     sprintf(fileName, "python MakeGraphs.py %s", shapeName);
     system(fileName);
 }
@@ -521,8 +513,8 @@ int main(int argc, char** argv)
 
 /*
 TODO:
-* seed R2? although i guess the others don't use the seed either so...?? what do they do for seeds
 * report RMSE
 * clean up this file, you copy/pasted this from unrelated code
 * can we force the legend in the upper right for all the graphs so it doesn't go into the lower left where the integration function is?
+! how do we show this story better? too much data right now
 */
