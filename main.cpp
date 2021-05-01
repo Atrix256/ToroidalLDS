@@ -12,9 +12,10 @@
 #include "stb_image_write.h"
 
 static const float c_pi = 3.14159265359f;
+static const float c_goldenRatioConjugate = 0.61803398875f;
 
-static const size_t c_numSamples = 256;  // should be a perfect square, for grid and hex sample generation
-static const size_t c_numTests = 10; // TODO: 1000?
+static const size_t c_numSamples = 256;
+static const size_t c_numTests = 10;
 
 #define DETERMINISTIC() true   // if true, all randomization will be the same every time.
 
@@ -344,6 +345,15 @@ float Triangle(const Vec2& _samplePos, const Vec2& offset)
     return (samplePos[0] < samplePos[1]) ? 0.0f : 1.0f;
 }
 
+static const float c_StepActualValue = c_goldenRatioConjugate;
+
+float Step(const Vec2& _samplePos, const Vec2& offset)
+{
+    Vec2 samplePos = Fract(_samplePos + offset);
+    return (samplePos[0] < c_goldenRatioConjugate) ? 1.0f : 0.0f;
+}
+
+
 template <typename LAMBDA>
 void DoTest(const LAMBDA& lambda, const float c_actualValue, const Samples& samples, std::vector<float>& absError, std::vector<float>& sqAbsError, size_t testIndex)
 {
@@ -408,129 +418,82 @@ void MakeIntegrandImage(const LAMBDA& lambda, const char* outputFileName)
     stbi_write_png(outputFileName, c_size, c_size, 1, pixels.data(), 0);
 }
 
+template <typename LAMBDA>
+void Test(const char* shapeName, float actualValue, const LAMBDA& lambda /*, Vec2 sampleOffset, int indexOffset*/)
+{
+    printf("===== %s =====\n", shapeName);
+
+    // write the sample counts into the csv
+    CSV results;
+    SetCSV(results, 0, 0, "Samples");
+    for (size_t index = 1; index <= c_numSamples; ++index)
+        SetCSV(results, 0, index, "%zu", index);
+
+    // for each type of sampling
+    for (const Samples& samples : g_samples)
+    {
+        // do the tests
+        std::vector<float> absError;
+        std::vector<float> sqAbsError;
+        int lastPercent = -1;
+        for (size_t testIndex = 0; testIndex < c_numTests; ++testIndex)
+        {
+            int percent = int(100.0f * float(testIndex) / float(c_numTests));
+            if (percent != lastPercent)
+            {
+                printf("\r%s: %i%%", samples.name, percent);
+                lastPercent = percent;
+            }
+            DoTest(lambda, actualValue, samples, absError, sqAbsError, testIndex);
+        }
+        printf("\r%s: 100%%\n", samples.name);
+
+        // if not progressive, only report the final error amount
+        if (!samples.progressive)
+        {
+            float lastAbsError = *absError.rbegin();
+            float lastSqAbsError = *sqAbsError.rbegin();
+            for (float& f : absError)
+                f = lastAbsError;
+            for (float& f : sqAbsError)
+                f = lastSqAbsError;
+        }
+
+        // write to the csv
+        size_t col = GetCSVCols(results);
+        SetCSV(results, col, 0, "%s", samples.name);
+        //SetCSV(results, col + 1, 0, "%s var", samples.name);
+        for (size_t index = 0; index < c_numSamples; ++index)
+        {
+            SetCSV(results, col, index + 1, "%f", absError[index]);
+
+            //float variance = abs(sqAbsError[index] - absError[index] * absError[index]);
+            //float stddev = sqrt(variance);
+            //SetCSV(results, col, index + 1, "%f", variance);
+        }
+    }
+
+    // write the output csv and integrand image
+    char fileName[1024];
+    sprintf(fileName, "out/%s.png", shapeName);
+    MakeIntegrandImage(lambda, fileName);
+    sprintf(fileName, "out/%s.csv", shapeName);
+    WriteCSV(results, fileName);
+
+    // run the python script
+    sprintf(fileName, "python MakeGraphs.py %s", shapeName);
+    system(fileName);
+}
+
 // ====================================================================
 
 int main(int argc, char** argv)
 {
     _mkdir("out");
 
-    // gaussian csv
-    {
-        // write the sample counts into the csv
-        CSV results;
-        SetCSV(results, 0, 0, "Samples");
-        for (size_t index = 1; index <= c_numSamples; ++index)
-            SetCSV(results, 0, index, "%zu", index);
-
-        // for each type of sampling
-        for (const Samples& samples : g_samples)
-        {
-            // do the tests
-            std::vector<float> absError;
-            std::vector<float> sqAbsError;
-            int lastPercent = -1;
-            for (size_t testIndex = 0; testIndex < c_numTests; ++testIndex)
-            {
-                int percent = int(100.0f * float(testIndex) / float(c_numTests));
-                if (percent != lastPercent)
-                {
-                    printf("\r%s: %i%%", samples.name, percent);
-                    lastPercent = percent;
-                }
-                DoTest(Gaussian, c_GaussianActualValue, samples, absError, sqAbsError, testIndex);
-            }
-            printf("\r%s: 100%%\n", samples.name);
-
-            // if not progressive, only report the final error amount
-            if (!samples.progressive)
-            {
-                float lastAbsError = *absError.rbegin();
-                float lastSqAbsError = *sqAbsError.rbegin();
-                for (float& f : absError)
-                    f = lastAbsError;
-                for (float& f : sqAbsError)
-                    f = lastSqAbsError;
-            }
-
-            // write to the csv
-            size_t col = GetCSVCols(results);
-            SetCSV(results, col, 0, "%s", samples.name);
-            //SetCSV(results, col + 1, 0, "%s var", samples.name);
-            for (size_t index = 0; index < c_numSamples; ++index)
-            {
-                SetCSV(results, col, index + 1, "%f", absError[index]);
-
-                //float variance = abs(sqAbsError[index] - absError[index] * absError[index]);
-                //float stddev = sqrt(variance);
-                //SetCSV(results, col, index + 1, "%f", variance);
-            }
-        }
-
-        // write the output csv and integrand image
-        MakeIntegrandImage(Gaussian, "out/gauss.png");
-        WriteCSV(results, "out/gauss.csv");
-    }
-
-    // triangle csv
-    {
-        // write the sample counts into the csv
-        CSV results;
-        SetCSV(results, 0, 0, "Samples");
-        for (size_t index = 1; index <= c_numSamples; ++index)
-            SetCSV(results, 0, index, "%zu", index);
-
-        // for each type of sampling
-        for (const Samples& samples : g_samples)
-        {
-            // do the tests
-            std::vector<float> absError;
-            std::vector<float> sqAbsError;
-            int lastPercent = -1;
-            for (size_t testIndex = 0; testIndex < c_numTests; ++testIndex)
-            {
-                int percent = int(100.0f * float(testIndex) / float(c_numTests));
-                if (percent != lastPercent)
-                {
-                    printf("\r%s: %i%%", samples.name, percent);
-                    lastPercent = percent;
-                }
-                DoTest(Triangle, c_TriangleActualValue, samples, absError, sqAbsError, testIndex);
-            }
-            printf("\r%s: 100%%\n", samples.name);
-
-            // if not progressive, only report the final error amount
-            if (!samples.progressive)
-            {
-                float lastAbsError = *absError.rbegin();
-                float lastSqAbsError = *sqAbsError.rbegin();
-                for (float& f : absError)
-                    f = lastAbsError;
-                for (float& f : sqAbsError)
-                    f = lastSqAbsError;
-            }
-
-            // write to the csv
-            size_t col = GetCSVCols(results);
-            SetCSV(results, col, 0, "%s", samples.name);
-            //SetCSV(results, col + 1, 0, "%s var", samples.name);
-            for (size_t index = 0; index < c_numSamples; ++index)
-            {
-                SetCSV(results, col, index + 1, "%f", absError[index]);
-
-                //float variance = abs(sqAbsError[index] - absError[index] * absError[index]);
-                //float stddev = sqrt(variance);
-                //SetCSV(results, col, index + 1, "%f", variance);
-            }
-        }
-
-        // write the output csv and integrand image
-        MakeIntegrandImage(Triangle, "out/triangle.png");
-        WriteCSV(results, "out/triangle.csv");
-    }
-
-    // make the graphs
-    printf("\nRunning MakeGraphs.py\n\n");
-    system("python MakeGraphs.py");
+    Test("gaussian", c_GaussianActualValue, Gaussian);
+    Test("triangle", c_TriangleActualValue, Triangle);
+    Test("step", c_StepActualValue, Step);
 
     return 0;
 }
@@ -538,6 +501,7 @@ int main(int argc, char** argv)
 
 /*
 TODO:
+* Test() has the beginnings for passing in spatial and index offsets.
 * seed R2? although i guess the others don't use the seed either so...?? what do they do for seeds
 * could also offset over index instead of just over distance
 * also offset the sequences toroidally.
