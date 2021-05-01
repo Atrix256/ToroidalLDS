@@ -538,14 +538,9 @@ int main(int argc, char** argv)
 
 /*
 TODO:
-* seed R2? although i guess the others don't use the seed either so...??
-* could also offset over time instead of just over distance
-* copy the ray traced soft shadows thing. integrate against a few different things?
+* seed R2? although i guess the others don't use the seed either so...?? what do they do for seeds
+* could also offset over index instead of just over distance
 * also offset the sequences toroidally.
-* R2, sobol, white
-* could make graphs and images in python
 * report RMSE
 * clean up this file, you copy/pasted this from unrelated code
-* clean up the MakeGraphs.py file
-
 */
