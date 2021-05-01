@@ -7,6 +7,7 @@
 #include <direct.h>
 #include <stdarg.h>
 #include <filesystem>
+#include <atomic>
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
@@ -15,7 +16,7 @@ static const float c_pi = 3.14159265359f;
 static const float c_goldenRatioConjugate = 0.61803398875f;
 
 static const size_t c_numSamples = 256;
-static const size_t c_numTests = 10;
+static const size_t c_numTests = 10000;
 
 #define DETERMINISTIC() true   // if true, all randomization will be the same every time.
 
@@ -353,13 +354,11 @@ float Step(const Vec2& _samplePos, const Vec2& offset)
     return (samplePos[0] < c_goldenRatioConjugate) ? 1.0f : 0.0f;
 }
 
-
 template <typename LAMBDA>
-void DoTest(const LAMBDA& lambda, const float c_actualValue, const Samples& samples, std::vector<float>& absError, std::vector<float>& sqAbsError, size_t testIndex)
+void DoTest(const LAMBDA& lambda, const float c_actualValue, const Samples& samples, std::vector<float>& absError, size_t testIndex, const Vec2& sampleOffset, int indexOffset)
 {
     // make sure the output arrays are the right size and initialized
     absError.resize(c_numSamples, 0.0f);
-    sqAbsError.resize(c_numSamples, 0.0f);
 
     // generate sample points
     std::vector<Vec2> samplePoints;
@@ -373,21 +372,19 @@ void DoTest(const LAMBDA& lambda, const float c_actualValue, const Samples& samp
         std::uniform_real_distribution<float> dist(0.0f, 1.0f);
         offset = Vec2{ dist(rng), dist(rng) };
     }
+    offset[0] += sampleOffset[0];
+    offset[1] += sampleOffset[1];
 
     // do sampling
     float value = 0.0f;
     for (size_t index = 0; index < c_numSamples; ++index)
     {
         // monte carlo integrate into value using these samples
-        float sampleValue = lambda(samplePoints[index], offset);
+        float sampleValue = lambda(samplePoints[(index + indexOffset) % c_numSamples], offset);
         value = Lerp(value, sampleValue, 1.0f / float(index + 1));
 
         // calculate the abs error
-        float abserr = std::abs(value - c_actualValue);
-
-        // calculate the average abs error and squared abs error for this sample count
-        absError[index] = Lerp(absError[index], abserr, 1.0f / float(testIndex + 1));
-        sqAbsError[index] = Lerp(sqAbsError[index], abserr * abserr, 1.0f / float(testIndex + 1));
+        absError[index] = std::abs(value - c_actualValue);
     }
 }
 
@@ -419,7 +416,7 @@ void MakeIntegrandImage(const LAMBDA& lambda, const char* outputFileName)
 }
 
 template <typename LAMBDA>
-void Test(const char* shapeName, float actualValue, const LAMBDA& lambda /*, Vec2 sampleOffset, int indexOffset*/)
+void Test(const char* shapeName, float actualValue, const LAMBDA& lambda, const Vec2& sampleOffset, int indexOffset)
 {
     printf("===== %s =====\n", shapeName);
 
@@ -433,20 +430,33 @@ void Test(const char* shapeName, float actualValue, const LAMBDA& lambda /*, Vec
     for (const Samples& samples : g_samples)
     {
         // do the tests
-        std::vector<float> absError;
-        std::vector<float> sqAbsError;
+        std::vector<std::vector<float>> absErrors(c_numTests);
         int lastPercent = -1;
-        for (size_t testIndex = 0; testIndex < c_numTests; ++testIndex)
+        std::atomic<int> testsDone = 0;
+        #pragma omp parallel for
+        for (int testIndex = 0; testIndex < c_numTests; ++testIndex)
         {
-            int percent = int(100.0f * float(testIndex) / float(c_numTests));
+            int percent = int(100.0f * float(testsDone.fetch_add(1)) / float(c_numTests));
             if (percent != lastPercent)
             {
                 printf("\r%s: %i%%", samples.name, percent);
                 lastPercent = percent;
             }
-            DoTest(lambda, actualValue, samples, absError, sqAbsError, testIndex);
+            DoTest(lambda, actualValue, samples, absErrors[testIndex], testIndex, sampleOffset, indexOffset);
         }
         printf("\r%s: 100%%\n", samples.name);
+
+        // create a combined absError and sqAbsError
+        std::vector<float> absError(c_numSamples, 0.0f);
+        std::vector<float> sqAbsError(c_numSamples, 0.0f);
+        for (int testIndex = 0; testIndex < c_numTests; ++testIndex)
+        {
+            for (size_t sampleIndex = 0; sampleIndex < c_numSamples; ++sampleIndex)
+            {
+                absError[sampleIndex] = Lerp(absError[sampleIndex], absErrors[testIndex][sampleIndex], 1.0f / float(testIndex + 1));
+                sqAbsError[sampleIndex] = Lerp(sqAbsError[sampleIndex], absErrors[testIndex][sampleIndex] * absErrors[testIndex][sampleIndex], 1.0f / float(testIndex + 1));
+            }
+        }
 
         // if not progressive, only report the final error amount
         if (!samples.progressive)
@@ -491,9 +501,19 @@ int main(int argc, char** argv)
 {
     _mkdir("out");
 
-    Test("gaussian", c_GaussianActualValue, Gaussian);
-    Test("triangle", c_TriangleActualValue, Triangle);
-    Test("step", c_StepActualValue, Step);
+    Test("gaussian", c_GaussianActualValue, Gaussian, Vec2{ 0.0f, 0.0f }, 0);
+    Test("triangle", c_TriangleActualValue, Triangle, Vec2{ 0.0f, 0.0f }, 0);
+    Test("step", c_StepActualValue, Step, Vec2{ 0.0f, 0.0f }, 0);
+
+    Vec2 spatialOffset = Vec2{0.3f, 0.4f};
+    Test("gaussian_os", c_GaussianActualValue, Gaussian, spatialOffset, 0);
+    Test("triangle_os", c_TriangleActualValue, Triangle, spatialOffset, 0);
+    Test("step_os", c_StepActualValue, Step, spatialOffset, 0);
+
+    int indexOffset = int(float(c_numSamples) * c_goldenRatioConjugate);
+    Test("gaussian_oi", c_GaussianActualValue, Gaussian, Vec2{ 0.0f, 0.0f }, indexOffset);
+    Test("triangle_oi", c_TriangleActualValue, Triangle, Vec2{ 0.0f, 0.0f }, indexOffset);
+    Test("step_oi", c_StepActualValue, Step, Vec2{ 0.0f, 0.0f }, indexOffset);
 
     return 0;
 }
@@ -501,10 +521,8 @@ int main(int argc, char** argv)
 
 /*
 TODO:
-* Test() has the beginnings for passing in spatial and index offsets.
 * seed R2? although i guess the others don't use the seed either so...?? what do they do for seeds
-* could also offset over index instead of just over distance
-* also offset the sequences toroidally.
 * report RMSE
 * clean up this file, you copy/pasted this from unrelated code
+* can we force the legend in the upper right for all the graphs so it doesn't go into the lower left where the integration function is?
 */
